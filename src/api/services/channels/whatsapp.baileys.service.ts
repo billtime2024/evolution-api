@@ -217,6 +217,41 @@ export class BaileysStartupService extends ChannelStartupService {
     this.client?.ws?.close();
   }
 
+  public async regenerateSession() {
+    this.logger.verbose('Regenerating session for: ' + this.instanceName);
+    try {
+      await this.refreshSignalSessions();
+
+      const db = this.configService.get<Database>('DATABASE');
+      const cache = this.configService.get<CacheConf>('CACHE');
+
+      if (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) {
+        const keys = await this.cache.keys(`${this.instanceName}:*`);
+        for (const key of keys) {
+          await this.cache.delete(key);
+        }
+      }
+
+      if (db.ENABLED) {
+        this.logger.verbose('Database enabled, clearing auth collection');
+        const collection = dbserver
+          .getClient()
+          .db(this.configService.get<Database>('DATABASE').CONNECTION.DB_PREFIX_NAME + '-instances')
+          .collection(this.instanceName);
+        await collection.deleteMany({ _id: { $regex: '^(session|pre-key|sender-key|app-state-sync-key)' } });
+      }
+
+      this.logger.verbose('Reconnecting after session regeneration');
+      await this.client?.ws?.close();
+      await this.connectToWhatsapp();
+
+      return { status: 'success', message: 'Session regenerated, reconnection initiated' };
+    } catch (error) {
+      this.logger.error('Error regenerating session: ' + error);
+      throw new InternalServerErrorException('Failed to regenerate session: ' + error?.toString());
+    }
+  }
+
   public async getProfileName() {
     this.logger.verbose('Getting profile name');
 
@@ -385,8 +420,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'close') {
       this.logger.verbose('Connection closed');
-      const shouldReconnect = (lastDisconnect.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = (lastDisconnect.error as Boom)?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      const needsSessionRefresh =
+        statusCode === DisconnectReason.badSession ||
+        statusCode === DisconnectReason.connectionClosed ||
+        statusCode === DisconnectReason.connectionReplaced;
+
       if (shouldReconnect) {
+        if (needsSessionRefresh) {
+          this.logger.info(`Connection closed with reason ${statusCode}, refreshing sessions before reconnect`);
+          await this.refreshSignalSessions();
+        }
         this.logger.verbose('Reconnecting to whatsapp');
         await this.connectToWhatsapp();
       } else {
@@ -443,6 +489,10 @@ export class BaileysStartupService extends ChannelStartupService {
         name: ${formattedName}
       `,
       );
+
+      this.refreshSignalSessions().catch((err) => {
+        this.logger.warn('Failed to refresh signal sessions on connect: ' + err?.message);
+      });
 
       if (this.localChatwoot.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -514,6 +564,50 @@ export class BaileysStartupService extends ChannelStartupService {
       return webMessageInfo[0].message;
     } catch (error) {
       return { conversation: '' };
+    }
+  }
+
+  private async refreshSignalSessions() {
+    this.logger.verbose('Refreshing signal sessions');
+    try {
+      const state = this.instance.authState.state;
+      const sessionKeys = await state.keys.get('session', []);
+      const sessionJids = Object.keys(sessionKeys);
+      if (sessionJids.length > 0) {
+        this.logger.info(`Clearing ${sessionJids.length} stale signal sessions`);
+        const emptySessions: Record<string, null> = {};
+        for (const jid of sessionJids) {
+          emptySessions[jid] = null;
+        }
+        await state.keys.set({ session: emptySessions });
+      }
+
+      const prekeyKeys = await state.keys.get('pre-key', []);
+      const prekeyIds = Object.keys(prekeyKeys);
+      if (prekeyIds.length > 0) {
+        this.logger.info(`Clearing ${prekeyIds.length} stale pre-keys`);
+        const emptyPrekeys: Record<string, null> = {};
+        for (const id of prekeyIds) {
+          emptyPrekeys[id] = null;
+        }
+        await state.keys.set({ 'pre-key': emptyPrekeys });
+      }
+
+      const senderKeyKeys = await state.keys.get('sender-key', []);
+      const senderKeyJids = Object.keys(senderKeyKeys);
+      if (senderKeyJids.length > 0) {
+        this.logger.info(`Clearing ${senderKeyJids.length} stale sender keys`);
+        const emptySenderKeys: Record<string, null> = {};
+        for (const jid of senderKeyJids) {
+          emptySenderKeys[jid] = null;
+        }
+        await state.keys.set({ 'sender-key': emptySenderKeys });
+      }
+
+      await this.instance.authState.saveCreds();
+      this.logger.info('Signal sessions refreshed successfully');
+    } catch (error) {
+      this.logger.warn('Error refreshing signal sessions: ' + error?.message);
     }
   }
 
@@ -643,7 +737,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
       userDevicesCache: this.userDevicesCache,
       transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 2500 },
-      patchMessageBeforeSending(message) {
+      patchMessageBeforeSending(message, recipientJids) {
         if (
           message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
         ) {
@@ -656,6 +750,10 @@ export class BaileysStartupService extends ChannelStartupService {
           message = JSON.parse(JSON.stringify(message));
 
           message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+        }
+
+        if (Array.isArray(recipientJids) && recipientJids.length > 0) {
+          return recipientJids.map((jid) => ({ ...message, recipientJid: jid }));
         }
 
         return message;
